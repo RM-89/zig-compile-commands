@@ -14,12 +14,9 @@ To get the package in your project, `cd` into its root directory and run:
 zig fetch --save-exact=compile_commands "https://github.com/RM-89/zig-compile-commands/archive/e1bcfe4300849a187387ef721d7fbc3cfc2ab849.tar.gz"
 ```
 
-This will add an entry in your `build.zig.zon` with the hash of the commit in
-that link (the 0.15.1/0.16.0 version). If you are using Zig v0.17.0, make sure
-to fetch a version of this package that supports it.
+This will add an entry to your `build.zig.zon` dependencies list. You can change the commit hash in the URL for other versions.
 
-The next step is to use it into your `build.zig` (zig compile commands is not a
-normal zig dependency, it is intended to be used as a build-time zig library):
+Use it in your `build.zig` like this:
 
 ```zig
 pub fn build(b: *std.Build) !void {
