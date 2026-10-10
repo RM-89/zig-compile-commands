@@ -27,7 +27,7 @@
         {
           packages =
             (with pkgs; [
-              zig_0_16
+              zig_0_17
               clang-tools
             ])
             ++ pkgs.lib.optionals (system != flake-utils.lib.system.aarch64-darwin) (with pkgs; [

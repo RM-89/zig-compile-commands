@@ -3,7 +3,7 @@
 A simple zig module to generate compile_commands.json from a slice of build
 targets. Useful if you are using zig as a build system for C/C++.
 
-Supports zig v0.16.0. Older versions are available in the commit history, but
+Supports zig v0.17.0. Older versions are available in the commit history, but
 not maintained.
 
 ## Example Usage
@@ -15,17 +15,17 @@ zig fetch --save-exact=compile_commands "https://github.com/the-argus/zig-compil
 ```
 
 This will add an entry in your `build.zig.zon` with the hash of the commit in
-that link (the 0.15.1/0.16.0 version).
+that link (the 0.15.1/0.16.0 version). If you are using Zig v0.17.0, make sure
+to fetch a version of this package that supports it.
 
-The next step is to use it into your `build.zig` by use `@import` on the
-dependency (zig compile commands is not a normal zig dependency, it is intended
-to be used as a build-time zig library):
+The next step is to use it into your `build.zig` (zig compile commands is not a
+normal zig dependency, it is intended to be used as a build-time zig library):
 
 ```zig
-// import the dependency
-const zcc = @import("compile_commands");
-
 pub fn build(b: *std.Build) !void {
+    // import the dependency's build.zig
+    const zcc = b.lazyImport(@This(), "compile_commands").?;
+
     // make a list of targets that have include files and c source files
     var targets: std.ArrayList(*std.Build.Step.Compile) = .empty;
 
@@ -81,25 +81,23 @@ source dependencies that you try to include will not be indexed. This includes
 zig fetched dependencies in versions of zig before 0.16.0, when dependencies
 were fetched into the global cache dir.
 
-## Building `compile_commands.json` panics
+## Building `compile_commands.json` fails or panics
 
-The Zig buildsystem creates folders at build time, to place generated files in.
-The paths to these folders is usually determined by the contents of the files.
-Therefore, in order for zig-compile-commands to put the right paths in the
-`compile_commands.json`, the files at those paths must have already been built.
-To achieve this, zig-compile-commands will traverse the build graph and depend
-on the build steps that generate those files. It does this during `createStep`.
-Steps added after the call to `createStep` may be missed. You may see output
-like this:
+The Zig build system creates folders at build time, to place generated files in
+(config headers, emitted include trees, ...). The exact locations of those files
+can only be known during the make phase of a Zig 0.17 build, not while your
+`build.zig` is running. For this reason, when zig-compile-commands scans your
+build graph it records every `LazyPath` it encounters and substitutes the
+resolved paths (which it gets from the make phase) into the generated file at
+the end. Through those `LazyPath`s, the step that generates
+`compile_commands.json` automatically depends on the steps that generate the
+files, so no extra work is normally required.
 
-```txt
-getPath() was called on a GeneratedFile that wasn't built yet.
-```
-
-It should be resolved by making sure nothing is added to the build graph after
-`createStep` is called. If that does not work, report an issue, and in the
-meantime you can do something like this, to guarantee that everything needed for
-the `compile_commands.json` is present before generation:
+One caveat: steps added to the build graph after `createStep` is called are not
+scanned, so their generated files will be missing from the database. Make sure
+nothing is added to the build graph after `createStep` is called. If you want to
+be certain that everything needed for the `compile_commands.json` is built
+before the file is generated, you can depend on the targets' compile steps:
 
 ```zig
     const compile_commands_step = zcc.createStep(b, .{

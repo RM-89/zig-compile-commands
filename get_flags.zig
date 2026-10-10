@@ -5,16 +5,10 @@
 /// (also, most of the relevant functions are private in std, so they have to
 /// be replicated here anyways)
 const std = @import("std");
-const fcompat = @import("file_compat.zig");
 const LazyPath = std.Build.LazyPath;
 const CompileCommandEntry = @import("compile_commands.zig").CompileCommandEntry;
-const Options = @import("compile_commands.zig").CompileCommandOptions;
-
-/// resolve paths from Cache.Directory and Cache.Path to be absolute (they should be relative to build root CWD).
-fn makeRelativeBuildPathAbsolute(b: *std.Build, allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
-    if (std.fs.path.isAbsolute(path)) return path;
-    return std.fs.path.resolve(allocator, &.{ try fcompat.getBuildRunnerCwd(b), path });
-}
+const CompileCommandOptions = @import("compile_commands.zig").CompileCommandOptions;
+const PathRegistry = @import("compile_commands.zig").PathRegistry;
 
 const InProgressCompileCommandsEntry = struct {
     directory: []const u8,
@@ -27,28 +21,30 @@ const CompileCommandsBuilder = struct {
         return .{};
     }
 
-    pub fn resolvePathAndAdd(self: *@This(), b: *std.Build, source: *std.Build.Module.CSourceFile) !void {
-        // the file for this is a LazyPath
-        const absolute_path = try source.file.getPath3(b, null).joinString(b.allocator, "");
-        const gop_result = try self.files.getOrPut(b.allocator, absolute_path);
+    pub fn resolvePathAndAdd(self: *@This(), b: *std.Build, registry: *PathRegistry, source: *std.Build.Module.CSourceFile) !void {
+        // the file for this is a LazyPath; both the file and its directory get
+        // a token which is substituted with the resolved path at make time
+        const file_token = registry.add(b, source.file, false);
+        const directory_token = registry.add(b, source.file.dirname(), true);
+        const gop_result = try self.files.getOrPut(b.allocator, file_token);
         if (!gop_result.found_existing) {
-            gop_result.value_ptr.* = .{ .directory = std.fs.path.dirname(absolute_path) orelse "/" };
+            gop_result.value_ptr.* = .{ .directory = directory_token };
         } else {
-            std.log.warn("Found duplicate source file in a single compile step: \"{s}\", ignoring repeated instance", .{absolute_path});
+            std.log.warn("Found duplicate source file in a single compile step: \"{s}\", ignoring repeated instance", .{file_token});
             return;
         }
         try gop_result.value_ptr.file_specific_flags.appendSlice(b.allocator, source.flags);
     }
-    pub fn resolvePathAndAddMany(self: *@This(), b: *std.Build, sources: *std.Build.Module.CSourceFiles) !void {
+    pub fn resolvePathAndAddMany(self: *@This(), b: *std.Build, registry: *PathRegistry, sources: *std.Build.Module.CSourceFiles) !void {
         // the files in CSourceFiles are subpaths from root
         for (sources.files) |subpath| {
-            const root = sources.root.getPath3(b, null);
-            const absolute_path = try root.joinString(b.allocator, subpath);
-            const gop_result = try self.files.getOrPut(b.allocator, absolute_path);
+            const file_token = registry.add(b, sources.root.path(b, subpath), false);
+            const directory_token = registry.add(b, sources.root, true);
+            const gop_result = try self.files.getOrPut(b.allocator, file_token);
             if (!gop_result.found_existing) {
-                gop_result.value_ptr.* = .{ .directory = std.fs.path.dirname(absolute_path) orelse "/" };
+                gop_result.value_ptr.* = .{ .directory = directory_token };
             } else {
-                std.log.warn("Found duplicate source file in a single compile step: \"{s}\", ignoring repeated instance", .{absolute_path});
+                std.log.warn("Found duplicate source file in a single compile step: \"{s}\", ignoring repeated instance", .{subpath});
                 continue;
             }
             try gop_result.value_ptr.file_specific_flags.appendSlice(b.allocator, sources.flags);
@@ -62,17 +58,18 @@ const CompileCommandsBuilder = struct {
     pub fn finish(
         self: *@This(),
         b: *std.Build,
+        registry: *PathRegistry,
         shared_flags: []const []const u8,
         driver: ?[]const u8,
         output: *std.ArrayList(CompileCommandEntry),
     ) !void {
-        const cwd_string = try fcompat.getCwd(b);
-        const global_cache_root = b.graph.global_cache_root.path orelse b.cache_root.path orelse cwd_string;
-
         try output.ensureUnusedCapacity(b.allocator, self.files.size);
         var iterator = self.files.iterator();
+        var idx: usize = 0;
         while (iterator.next()) |hm_entry| {
-            const output_str = b.fmt("{s}.o", .{b.pathJoin(&.{ global_cache_root, std.fs.path.basename(hm_entry.key_ptr.*) })});
+            const output_str = registry.add(b, .{
+                .relative = .{ .base = .global_cache, .sub_path = b.fmt("zcc-{d}.o", .{idx}) },
+            }, false);
 
             // for each source file, create a new set of flags which is the shared flags + file specific flags
             var allflags: std.ArrayList([]const u8) = .empty; // leak this
@@ -89,19 +86,21 @@ const CompileCommandsBuilder = struct {
                 .output = output_str,
                 .arguments = allflags.items,
             });
+            idx += 1;
         }
     }
 };
 
 const GenerateCompileCommandsParameters = struct {
     output: *std.ArrayList(CompileCommandEntry),
-    options: Options,
+    options: CompileCommandOptions,
 };
 /// configuration parameters and intermediate data
 const GenerateCompileCommandsIntermediate = struct {
     params: GenerateCompileCommandsParameters,
     allocator: std.mem.Allocator,
     flags: *std.ArrayList([]const u8), // per-module not per-file
+    registry: *PathRegistry,
 };
 const GenerateLazyPathParameters = struct {
     output: *std.ArrayList(LazyPath),
@@ -118,7 +117,7 @@ const GenerateOutput = struct {
         return self.params == .cc_params;
     }
 
-    pub fn options(self: *const @This()) ?Options {
+    pub fn options(self: *const @This()) ?CompileCommandOptions {
         switch (self.params) {
             .cc_params => |intermediate| return intermediate.params.options,
             else => return null,
@@ -129,7 +128,7 @@ const GenerateOutput = struct {
     /// does not use our allocator or modify us, just reads self.params to check if we are resolving the paths or not
     pub fn addResolvedPath(self: *const @This(), b: *std.Build, builder: *CompileCommandsBuilder, source_file: *std.Build.Module.CSourceFile) !void {
         switch (self.params) {
-            .cc_params => try builder.resolvePathAndAdd(b, source_file),
+            .cc_params => |params| try builder.resolvePathAndAdd(b, params.registry, source_file),
             .lazy_path_params => |params| try params.output.append(b.allocator, source_file.file),
         }
     }
@@ -137,7 +136,7 @@ const GenerateOutput = struct {
     /// does not use our allocator or modify us, just reads self.params to check if we are resolving the paths or not
     pub fn addResolvedPaths(self: *const @This(), b: *std.Build, builder: *CompileCommandsBuilder, source_files: *std.Build.Module.CSourceFiles) !void {
         switch (self.params) {
-            .cc_params => try builder.resolvePathAndAddMany(b, source_files),
+            .cc_params => |params| try builder.resolvePathAndAddMany(b, params.registry, source_files),
             .lazy_path_params => |params| try params.output.append(b.allocator, source_files.root),
         }
     }
@@ -146,14 +145,13 @@ const GenerateOutput = struct {
         const b = asking_step.owner;
         switch (self.params) {
             .cc_params => |params| {
-                const resolved_str = try include_dir.path.getPath3(b, asking_step).toString(params.allocator);
-                const absolute_str = try makeRelativeBuildPathAbsolute(b, params.allocator, resolved_str);
+                const token = params.registry.add(b, include_dir.path, true);
                 switch (include_dir.flag) {
                     .prefix => |prefix| {
-                        return self.appendFlagSlice(&.{ prefix, absolute_str });
+                        return self.appendFlagSlice(&.{ prefix, token });
                     },
                     .embed_path => {
-                        return self.appendFlag(b.fmt("--embed-dir={s}", .{absolute_str}));
+                        return self.appendFlag(b.fmt("--embed-dir={s}", .{token}));
                     },
                 }
             },
@@ -264,9 +262,9 @@ fn appendFlagsForModule(
     }
 
     if (mod.optimize) |optimize| switch (optimize) {
-        .Debug => try output.appendFlag("-O0"),
-        .ReleaseSmall => try output.appendFlag("-Os"),
-        .ReleaseFast, .ReleaseSafe => try output.appendFlag("-O3"),
+        .debug => try output.appendFlag("-O0"),
+        .small => try output.appendFlag("-Os"),
+        .fast, .safe => try output.appendFlag("-O3"),
     };
 
     if (mod.code_model != .default) {
@@ -360,6 +358,10 @@ fn appendTargetCpuFlags(output: GenerateOutput, target: *const std.Target) !void
 /// Replicate the include flags passed to clang in order to tell it to use
 /// Zig's bundled C stdlib. From addCCArgs in src/Compilation.zig of the
 /// compiler. This enables finding standard library C and C++ headers.
+///
+/// The exact libc include paths detected by the compiler (`LibCDirs`) cannot be
+/// known at configure time in Zig 0.17, so only the paths that are statically
+/// known relative to the Zig lib directory are emitted here.
 fn appendBundledLibcIncludeFlags(
     output: GenerateOutput,
     b: *std.Build,
@@ -368,7 +370,7 @@ fn appendBundledLibcIncludeFlags(
 ) !void {
     if (!output.wantsFlags()) return;
 
-    const allocator = output.params.cc_params.allocator;
+    const registry = output.params.cc_params.registry;
 
     const link_libc = mod.link_libc orelse false;
     const link_libcpp = mod.link_libcpp orelse false;
@@ -378,31 +380,30 @@ fn appendBundledLibcIncludeFlags(
     // driver or --sysroot or default systemwide installation happen
     if (!std.zig.target.canBuildLibC(target)) return;
 
-    const zig_lib_dir = try makeRelativeBuildPathAbsolute(
-        b,
-        allocator,
-        b.graph.zig_lib_directory.path orelse return,
-    );
-
     try output.appendFlag("-nostdinc");
 
     if (link_libcpp) {
+        try appendLibCxxDefines(output, mod, target);
+
+        const libcxx_include = registry.add(b, .{
+            .relative = .{ .base = .zig_lib, .sub_path = "libcxx/include" },
+        }, true);
+        const libcxxabi_include = registry.add(b, .{
+            .relative = .{ .base = .zig_lib, .sub_path = "libcxxabi/include" },
+        }, true);
         try output.appendFlagSlice(&.{
             "-isystem",
-            b.pathJoin(&.{ zig_lib_dir, "libcxx", "include" }),
+            libcxx_include,
             "-isystem",
-            b.pathJoin(&.{ zig_lib_dir, "libcxxabi", "include" }),
+            libcxxabi_include,
         });
-        try appendLibCxxDefines(output, b, mod, target);
     }
 
     // clang builtin headers that must be included first
-    try output.appendFlagSlice(&.{ "-isystem", b.pathJoin(&.{ zig_lib_dir, "include" }) });
-
-    const libc_dirs = try std.zig.LibCDirs.detectFromBuilding(allocator, zig_lib_dir, target);
-    for (libc_dirs.libc_include_dir_list) |include_dir| {
-        try output.appendFlagSlice(&.{ "-isystem", include_dir });
-    }
+    const zig_include = registry.add(b, .{
+        .relative = .{ .base = .zig_lib, .sub_path = "include" },
+    }, true);
+    try output.appendFlagSlice(&.{ "-isystem", zig_include });
 }
 
 /// Zig does not use clang's config header and instead manually passes flags to
@@ -410,7 +411,6 @@ fn appendBundledLibcIncludeFlags(
 /// is replicated here
 fn appendLibCxxDefines(
     output: GenerateOutput,
-    b: *std.Build,
     mod: *std.Build.Module,
     target: *const std.Target,
 ) !void {
@@ -431,21 +431,14 @@ fn appendLibCxxDefines(
         }
     }
 
-    // the hardening mode is determined by libc++ build flags. See compilerRtOptMode in src/Compilation.zig
-    const debug_runtime_libs_mode: ?std.builtin.OptimizeMode = if (fcompat.is_0_16_or_newer)
-        b.graph.debug_compiler_runtime_libs
-    else if (b.graph.debug_compiler_runtime_libs)
-        .Debug
-    else
-        null;
-    const optimize_mode: std.builtin.OptimizeMode = debug_runtime_libs_mode orelse switch (mod.optimize orelse .Debug) {
-        // defaultCompilerRtOptimizeMode in src/target.zig
-        .Debug, .ReleaseSafe => if (target.cpu.arch.isWasm() and target.os.tag == .freestanding)
-            std.builtin.OptimizeMode.ReleaseSmall
+    // defaultCompilerRtOptimizeMode in src/target.zig
+    const optimize_mode: std.builtin.Optimize = switch (mod.optimize orelse .debug) {
+        .debug, .safe => if (target.cpu.arch.isWasm() and target.os.tag == .freestanding)
+            std.builtin.Optimize.small
         else
-            .ReleaseFast,
-        .ReleaseFast => .ReleaseFast,
-        .ReleaseSmall => .ReleaseSmall,
+            .fast,
+        .fast => .fast,
+        .small => .small,
     };
 
     const abi_version: u2 = if (target.os.tag == .emscripten) 2 else 1;
@@ -470,17 +463,14 @@ fn appendLibCxxDefines(
     // zig always uses this backend (not sure what other options there are?)
     try output.appendFlag("-D_LIBCPP_PSTL_BACKEND_SERIAL");
     try output.appendFlag(switch (optimize_mode) {
-        .Debug => "-D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_DEBUG",
-        .ReleaseFast, .ReleaseSmall => "-D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_NONE",
-        .ReleaseSafe => "-D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_FAST",
+        .debug => "-D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_DEBUG",
+        .fast, .small => "-D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_NONE",
+        .safe => "-D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_FAST",
     });
     if (target.isGnuLibC()) {
         if (target.os.versionRange().gnuLibCVersion().?.order(.{ .major = 2, .minor = 16, .patch = 0 }) == .lt) {
             try output.appendFlag("-D_LIBCPP_HAS_LIBRARY_ALIGNED_ALLOCATION=0");
         }
-    }
-    if (!fcompat.is_0_16_or_newer) { // removed after 0.15
-        try output.appendFlag("-D_LIBCPP_ENABLE_CXX17_REMOVED_UNEXPECTED_FUNCTIONS");
     }
 }
 
@@ -511,38 +501,10 @@ fn appendFlagsForSystemLib(
         if (system_lib.weak) break :prefix "-weak-l";
         break :prefix "-l";
     };
-    switch (system_lib.use_pkg_config) {
-        .no => if (output.wantsFlags()) try output.appendFlag(b.fmt("{s}{s}", .{ prefix, system_lib.name })),
-        .yes, .force => {
-            if (std.Build.Step.Compile.runPkgConfig(&step.step, system_lib.name)) |result| {
-                const all_flags = try std.mem.concat(b.allocator, []const u8, &.{ result.cflags, result.libs });
-                try output.appendFlagSlice(all_flags);
-                try system_lib_flags_cache.put(b.allocator, system_lib.name, all_flags);
-            } else |err| switch (err) {
-                error.PkgConfigInvalidOutput,
-                error.PkgConfigCrashed,
-                error.PkgConfigFailed,
-                error.PkgConfigNotInstalled,
-                error.PackageNotFound,
-                => switch (system_lib.use_pkg_config) {
-                    .yes => {
-                        // pkg-config failed, so fall back to linking the library
-                        // by name directly.
-                        if (output.wantsFlags()) try output.appendFlag(b.fmt("{s}{s}", .{
-                            prefix,
-                            system_lib.name,
-                        }));
-                    },
-                    .force => {
-                        std.log.err("pkg-config failed for library \"{s}\", unable to append any flags it may export to its dependent step \"{s}\"", .{ system_lib.name, step.name });
-                    },
-                    .no => unreachable,
-                },
-
-                else => |e| return e,
-            }
-        },
-    }
+    // pkg-config based flags cannot be computed at configure time in Zig 0.17,
+    // so only the -l flag is emitted, matching what happens when pkg-config is
+    // not installed.
+    if (output.wantsFlags()) try output.appendFlag(b.fmt("{s}{s}", .{ prefix, system_lib.name }));
 }
 
 /// Get all the LazyPaths that must be resolved before
@@ -558,7 +520,8 @@ pub fn compileStepPathDependencies(
 
 pub fn compileStepToCompileCommandEntries(
     step: *std.Build.Step.Compile,
-    options: Options,
+    options: CompileCommandOptions,
+    registry: *PathRegistry,
     output: *std.ArrayList(CompileCommandEntry),
     do_later: *std.ArrayList(*std.Build.Step.Compile),
 ) !void {
@@ -570,6 +533,7 @@ pub fn compileStepToCompileCommandEntries(
         },
         .allocator = step.step.owner.allocator,
         .flags = &flags,
+        .registry = registry,
     } } };
     return generateCompileCommandEntriesOrGatherDependencies(step, do_later, intermediate_output);
 }
@@ -586,12 +550,6 @@ fn generateCompileCommandEntriesOrGatherDependencies(
 
     // these are additional per-file flags, stored by absolute path to source file
     var file_flags = CompileCommandsBuilder.init();
-    if (b.reference_trace) |some| {
-        if (output.wantsFlags()) {
-            try output.appendFlag(b.fmt("-freference-trace={d}", .{some}));
-        }
-    }
-
     // not adding -lc -lc++ here
     {
         var system_lib_flags_cache: std.StringHashMapUnmanaged([]const []const u8) = .empty;
@@ -600,7 +558,7 @@ fn generateCompileCommandEntriesOrGatherDependencies(
 
         for (step.getCompileDependencies(false)) |dep_compile| {
             const my_responsibility = dep_compile == step;
-            if (!my_responsibility and find(*std.Build.Step.Compile, do_later.items, &.{dep_compile}) == null) {
+            if (!my_responsibility and find(dep_compile, do_later.items) == null) {
                 try do_later.append(b.allocator, dep_compile);
             }
 
@@ -621,7 +579,7 @@ fn generateCompileCommandEntriesOrGatherDependencies(
                         // linking a static library by path offers nothing to compile_commands.json
                         .static_path => {},
                         .other_step => |other_step| {
-                            if (other_step != step and find(*std.Build.Step.Compile, do_later.items, &.{other_step}) == null) {
+                            if (other_step != step and find(other_step, do_later.items) == null) {
                                 try do_later.append(b.allocator, other_step);
                             }
                             // clangd doesnt care about linking against a test or object file or library or adding to rpath
@@ -673,13 +631,13 @@ fn generateCompileCommandEntriesOrGatherDependencies(
         try output.appendFlag(b.fmt("-mexec-model={s}", .{@tagName(model)}));
     }
 
-    if (b.sysroot) |sysroot| {
-        try output.appendFlagSlice(&[_][]const u8{ "--sysroot", sysroot });
-    }
-
     // NOTE: the actual zig std code checks if the directories exist before doing this
-    for (b.search_prefixes.items) |search_prefix| {
-        try output.appendFlagSlice(&.{ "-I", try makeRelativeBuildPathAbsolute(b, b.allocator, b.pathJoin(&.{ search_prefix, "include" })) });
+    if (output.wantsFlags()) {
+        const registry = output.params.cc_params.registry;
+        for (b.graph.search_prefixes.items) |search_prefix| {
+            const lp = b.graph.cwdRelativePath(b.pathJoin(&.{ search_prefix, "include" }));
+            try output.appendFlagSlice(&.{ "-I", registry.add(b, lp, true) });
+        }
     }
 
     try output.appendFNoFlag("PIE", step.pie);
@@ -693,15 +651,11 @@ fn generateCompileCommandEntriesOrGatherDependencies(
     }
 
     switch (output.params) {
-        .cc_params => |params| return file_flags.finish(b, params.flags.items, params.params.options.driver, params.params.output),
+        .cc_params => |params| return file_flags.finish(b, params.registry, params.flags.items, params.params.options.driver, params.params.output),
         .lazy_path_params => {},
     }
 }
 
-fn find(comptime T: type, haystack: []const T, needle: []const T) ?usize {
-    if (fcompat.is_0_16_or_newer) {
-        return std.mem.find(T, haystack, needle);
-    } else {
-        return std.mem.indexOf(T, haystack, needle);
-    }
+fn find(step: *std.Build.Step.Compile, haystack: []const *std.Build.Step.Compile) ?usize {
+    return std.mem.find(*std.Build.Step.Compile, haystack, &.{step});
 }

@@ -1,15 +1,18 @@
 const std = @import("std");
-const builtin = @import("builtin");
-const fcompat = @import("file_compat.zig");
 const get_flags = @import("get_flags.zig");
+const gen_helper_source = @embedFile("gen_compile_commands.zig");
 
-const CSourceFiles = std.Build.Module.CSourceFiles;
 const LazyPath = std.Build.LazyPath;
 const TargetsSlice = []*std.Build.Step.Compile;
 
+/// Prefix/suffix used to mark paths that must be resolved by the make phase in
+/// the JSON template. Must stay in sync with `gen_compile_commands.zig`.
+pub const path_token_prefix = "@@ZCC_PATH_";
+pub const path_token_suffix = "@@";
+
 pub const CompileCommandOptions = struct {
     name: []const u8,
-    targets: []*std.Build.Step.Compile,
+    targets: TargetsSlice,
     // Alternative command driver path (eg: /usr/local/bin/clang++)
     // It will use `clang` if not specified this.
     driver: ?[]const u8 = null,
@@ -21,38 +24,11 @@ pub const CompileCommandOptions = struct {
     // output the compile_commands.json to a file other than
     // $PWD/compile_commands.json. Mainly used by tests. Will cause an error
     // the file path does not exist.
-    // NOTE: if you choose this then be aware that the CompileCommandsStep
-    // will depend on the generation of this path.
+    // NOTE: if you choose this then be aware that this step will depend on the
+    // generation of this path.
     custom_output_directory: ?std.Build.LazyPath = null,
     // Output a file that is called something other than "compile_commands.json"
     custom_output_filename: ?[]const u8 = null,
-};
-
-const CompileCommandsStep = struct {
-    step: std.Build.Step,
-    compile_steps: TargetsSlice,
-    options: CompileCommandOptions,
-
-    fn create(b: *std.Build, options: CompileCommandOptions) *CompileCommandsStep {
-        const self = b.allocator.create(@This()) catch @panic("Allocation failure, probably OOM");
-        var owned_options = options;
-        owned_options.targets = b.allocator.dupe(*std.Build.Step.Compile, options.targets) catch @panic("Allocation failure, probably OOM");
-        self.* = .{
-            .step = std.Build.Step.init(.{
-                .id = .custom,
-                .name = "cc_file",
-                .makeFn = makeCdb,
-                .owner = b,
-            }),
-            .compile_steps = owned_options.targets,
-            .options = owned_options,
-        };
-        if (self.options.custom_output_directory) |output_lazy_path| {
-            // our step should depend on the generation of this path
-            output_lazy_path.addStepDependencies(&self.step);
-        }
-        return self;
-    }
 };
 
 pub const CompileCommandEntry = struct {
@@ -62,109 +38,84 @@ pub const CompileCommandEntry = struct {
     output: []const u8,
 };
 
-pub fn createStep(b: *std.Build, options: CompileCommandOptions) *std.Build.Step {
-    const step = CompileCommandsStep.create(b, options);
+/// Collects all `LazyPath`s that appear in compile_commands.json while the
+/// compile_commands entries are being computed at configure time. Each path is
+/// assigned a token of the form `@@ZCC_PATH_<n>@@`; the token is what ends up
+/// inside the JSON template. During the make phase the resolved paths are passed
+/// as command line arguments to `gen_compile_commands`, in order, and the tokens
+/// are replaced.
+pub const PathRegistry = struct {
+    paths: std.ArrayList(LazyPath) = .empty,
+    is_dirs: std.ArrayList(bool) = .empty,
 
-    const cdb_step = b.step(options.name, "Create compile_commands.json");
-    cdb_step.dependOn(&step.step);
-
-    // do a dummy run through generating compile commands and gather the needed LazyPaths
-    var lazy_paths: std.ArrayList(LazyPath) = .empty;
-    var idx: usize = 0;
-    var csteps: std.ArrayList(*std.Build.Step.Compile) = .empty;
-    csteps.appendSlice(b.allocator, options.targets) catch @panic("OOM");
-    while (idx < csteps.items.len) {
-        defer idx += 1;
-        lazy_paths.clearRetainingCapacity();
-        get_flags.compileStepPathDependencies(csteps.items[idx], &lazy_paths, &csteps) catch |err| {
-            std.log.err("Error getting leaf dependencies of compile step {s}: {}", .{ csteps.items[idx].name, err });
-            continue;
-        };
-        for (lazy_paths.items) |lazy_path| {
-            lazy_path.addStepDependencies(&step.step);
-        }
+    pub fn add(self: *PathRegistry, b: *std.Build, path: LazyPath, is_dir: bool) []const u8 {
+        const index = self.paths.items.len;
+        self.paths.append(b.allocator, path.dupe(b.graph)) catch @panic("OOM");
+        self.is_dirs.append(b.allocator, is_dir) catch @panic("OOM");
+        return b.fmt("{s}{d}{s}", .{ path_token_prefix, index, path_token_suffix });
     }
+};
 
-    return &step.step;
-}
-
-fn makeCdb(step: *std.Build.Step, make_options: std.Build.Step.MakeOptions) anyerror!void {
-    _ = make_options;
-
-    const cc_step: *CompileCommandsStep = @fieldParentPtr("step", step);
-    const b = step.owner;
+pub fn createStep(b: *std.Build, options: CompileCommandOptions) *std.Build.Step {
+    // Compute all of the compile_commands.json entries at configure time. Any
+    // path which cannot be fully resolved until the make phase (config headers,
+    // emitted include trees, generated source files, ...) is replaced by a
+    // token, and the corresponding `LazyPath` is recorded in `registry`.
+    var registry = PathRegistry{};
     var compile_commands: std.ArrayList(CompileCommandEntry) = .empty;
     var idx: usize = 0;
     var csteps: std.ArrayList(*std.Build.Step.Compile) = .empty;
-    try csteps.appendSlice(b.allocator, cc_step.compile_steps);
-    while (idx < csteps.items.len) {
-        defer idx += 1;
-        try get_flags.compileStepToCompileCommandEntries(csteps.items[idx], cc_step.options, &compile_commands, &csteps);
-    }
-
-    var threaded: std.Io.Threaded = .init_single_threaded;
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    var output_file = block: {
-        const output_filename: []const u8 = cc_step.options.custom_output_filename orelse "compile_commands.json";
-
-        const dir = dir_block: {
-            if (cc_step.options.custom_output_directory) |custom_output_directory| {
-                const cache_path = try custom_output_directory.getPath4(b, &cc_step.step);
-                const stat = try cache_path.statFile(io, "");
-                if (stat.kind != .directory) {
-                    std.log.err(
-                        \\Refusing to output compile_commands.json to anything other
-                        \\than a regular directory. Requested output dir was {s}, of type {}
-                    , .{ try cache_path.toString(b.allocator), stat.kind });
-                    return error.RequestedCompileCommandsOutputWasNotRegularDirectory;
-                }
-
-                break :dir_block try cache_path.openDir(io, "", .{});
-            } else if (b.build_root.path) |build_root_path| {
-                break :dir_block try std.Io.Dir.openDirAbsolute(io, build_root_path, .{});
-            } else {
-                const cwd_string = try std.process.currentPathAlloc(io, b.allocator);
-                std.log.warn(
-                    \\No build root path specified by the build system for
-                    \\ compile_commands.json output, falling back to process CWD {s}
-                , .{cwd_string});
-                // std.Io.Dir.cwd() would be better but we want to print it as a string before this
-                break :dir_block try std.Io.Dir.openDirAbsolute(io, cwd_string, .{});
-            }
+    csteps.appendSlice(b.allocator, options.targets) catch @panic("OOM");
+    while (idx < csteps.items.len) : (idx += 1) {
+        const compile_step = csteps.items[idx];
+        get_flags.compileStepToCompileCommandEntries(compile_step, options, &registry, &compile_commands, &csteps) catch |err| {
+            std.log.err("Error getting compile commands of compile step {s}: {}", .{ compile_step.name, err });
+            continue;
         };
-        defer dir.close(io);
-        break :block try dir.createFile(io, output_filename, .{});
-    };
-    defer output_file.close(io);
-
-    try writeCompileCommands(io, &output_file, compile_commands.items);
-}
-
-fn writeCompileCommands(
-    io: ?std.Io,
-    file: *fcompat.File,
-    compile_commands: []CompileCommandEntry,
-) !void {
-    var buf: [std.json.default_buffer_size]u8 = undefined;
-    var writer: fcompat.Writer = undefined;
-
-    if (fcompat.is_0_16_or_newer) {
-        const iop = io orelse return error.NoIoAvailable;
-        writer = file.*.writer(iop, &buf);
-    } else {
-        writer = file.*.writer(&buf);
     }
 
-    var stringify = std.json.Stringify{
-        .writer = &writer.interface,
-        .options = .{
-            .whitespace = .indent_tab,
-            .emit_null_optional_fields = false,
-        },
-    };
+    // Serialize the entries (with path tokens) to a JSON template.
+    const template = std.json.Stringify.valueAlloc(b.allocator, compile_commands.items, .{
+        .whitespace = .indent_tab,
+        .emit_null_optional_fields = false,
+    }) catch @panic("OOM");
 
-    try stringify.write(compile_commands);
-    try writer.interface.flush();
+    const write_files = b.addWriteFiles();
+    const template_lp = write_files.add("compile_commands_template.json", template);
+    const helper_src_lp = write_files.add("gen_compile_commands.zig", gen_helper_source);
+
+    // Compile the helper program for the host; it substitutes the resolved
+    // paths into the JSON template and writes the final
+    // "compile_commands.json".
+    const helper_exe = b.addExecutable(.{
+        .name = "zcc-gen-compile-commands",
+        .root_module = b.createModule(.{
+            .root_source_file = helper_src_lp,
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+        }),
+    });
+
+    const run = b.addRunArtifact(helper_exe);
+    run.addFileArg2(template_lp, .{ .make_absolute = true });
+    const output_directory: LazyPath = options.custom_output_directory orelse
+        .{ .relative = .{ .base = .build_root } };
+    run.addDirectoryArg2(output_directory, .{ .make_absolute = true });
+    run.addArg(options.custom_output_filename orelse "compile_commands.json");
+    for (registry.paths.items, registry.is_dirs.items) |path, is_dir| {
+        const arg_options = std.Build.Step.Run.PathArgOptions{ .make_absolute = true };
+        if (is_dir) {
+            run.addDirectoryArg2(path, arg_options);
+        } else {
+            run.addFileArg2(path, arg_options);
+        }
+    }
+    // The helper writes directly to the requested output directory, which is a
+    // side effect that the build system does not know about.
+    run.has_side_effects = true;
+
+    const cdb_step = b.step(options.name, "Create compile_commands.json");
+    cdb_step.dependOn(&run.step);
+
+    return &run.step;
 }
